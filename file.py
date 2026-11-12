@@ -3,108 +3,120 @@ from pypdf import PdfReader
 from docx import Document
 import re
 
-filePath = Path(__file__)
-
-folder = filePath.parent
-
-files = [f.name for f in folder.iterdir() if f.is_file()]
-
-print(files)
-
-fileName = input().strip()
-folderName = input().strip()
-contentToBeSearched = input().strip()
+scriptFolder = Path(__file__).parent
 
 
-pattern = re.escape(contentToBeSearched)
+# Each readLines... function uses "yield" to hand back one line at a time,
+# so the whole file's text is never joined into one big string.
 
-def readText(path):
-    path = Path(path)
+def readLinesFromPdf(path):
+    reader = PdfReader(path)
+    # Pages are extracted one at a time, then split into lines
+    for page in reader.pages:
+        pageText = page.extract_text()
+        if pageText is None:
+            continue
+        for line in pageText.splitlines():
+            yield line
+
+
+def readLinesFromDocx(path):
+    document = Document(path)
+    for paragraph in document.paragraphs:
+        yield paragraph.text
+
+
+def readLinesFromPlainFile(path):
+    # txt, csv, py, etc. are plain text files.
+    # Looping over the file object reads it one line at a time.
+    with open(path, "r", encoding="utf-8") as file:
+        for line in file:
+            yield line
+
+
+def readLines(path):
     extension = path.suffix.lower()
 
     if extension == ".pdf":
-        reader = PdfReader(path)
-        allText = ""
-        for page in reader.pages:
-            pageText = page.extract_text()
-            if pageText is None:
-                pageText = ""
-            allText = allText + pageText + "\n"
-        return allText
+        return readLinesFromPdf(path)
 
     if extension == ".docx":
-        document = Document(path)
-        allText = ""
-        for paragraph in document.paragraphs:
-            allText = allText + paragraph.text + "\n"
-        return allText
+        return readLinesFromDocx(path)
 
-    # txt, csv, py, etc. are plain text
-    return path.read_text(encoding="utf-8")
+    return readLinesFromPlainFile(path)
 
-def openAllFilesAndFindPattern(pattern, targetFolder):
-    targetFolder = Path(targetFolder)
+
+def checkFileForPattern(path, pattern):
+    # Compile once so the pattern isn't re-processed for every line
+    compiledPattern = re.compile(pattern)
+
+    try:
+        # Check each line and stop as soon as one matches
+        for line in readLines(path):
+            if compiledPattern.search(line) is not None:
+                print(path.name + ": match found")
+                return
+    except Exception:
+        print(path.name + ": could not be read")
+        return
+
+    print(path.name + ": match not found")
+
+
+def searchOneFile(targetFolder, fileName, pattern):
+    filePath = targetFolder / fileName
+
+    if filePath.is_file():
+        checkFileForPattern(filePath, pattern)
+    else:
+        print("file '" + fileName + "' not found in '" + str(targetFolder) + "'")
+
+
+def searchAllFiles(targetFolder, pattern):
+    allItems = sorted(targetFolder.iterdir())
+
+    for item in allItems:
+        if item.is_file():
+            checkFileForPattern(item, pattern)
+
+
+def getFileNamesInFolder(targetFolder):
+    fileNames = []
+    for item in targetFolder.iterdir():
+        if item.is_file():
+            fileNames.append(item.name)
+    fileNames.sort()
+    return fileNames
+
+
+def main():
+    folderName = input("Folder to search (leave blank for this folder): ")
+    folderName = folderName.strip()
+    targetFolder = scriptFolder / folderName
+
     if not targetFolder.is_dir():
-        print(f"folder '{targetFolder}' not found")
+        print("folder '" + str(targetFolder) + "' not found")
         return
-    for f in sorted(targetFolder.iterdir()):
-        if not f.is_file():
-            continue
-        file = f.name
-        try:
-            text = readText(f)
-        except Exception:
-            print(f"{file}: could not be read")
-            continue
-        hasMatch = bool(re.search(pattern, text))
-        if hasMatch:
-            print(f"{file}: match found")
-        else:
-            print(f"{file}: match not found")
 
-def searchForFileInCurrentFolder(file, pattern=None):
-    try:
-        if file in files:
-            if pattern is not None:
-                try:
-                    text = readText(folder / file)
-                except Exception:
-                    print(f"{file}: could not be read")
-                    return files.index(file)
-                if re.search(pattern, text):
-                    print(f"{file}: match found")
-                else:
-                    print(f"{file}: match not found")
-            return files.index(file)
-        else:
-            raise FileNotFoundError
-    except FileNotFoundError:
-        print("file with this name not found")
+    fileNames = getFileNamesInFolder(targetFolder)
+    print("Files in this folder:", fileNames)
 
-def searchForFileInMentionedFolder(folder, file, pattern=None):
-    folder = Path(folder)
-    if not folder.is_dir():
-        print(f"folder '{folder}' not found")
+    fileName = input("File name (leave blank to search all files): ")
+    fileName = fileName.strip()
+
+    contentToBeSearched = input("Text to search for: ")
+    contentToBeSearched = contentToBeSearched.strip()
+
+    if contentToBeSearched == "":
+        print("search text cannot be empty")
         return
-    try:
-        for f in folder.iterdir():
-            if f.is_file() and f.name == file:
-                if pattern is not None:
-                    try:
-                        text = readText(f)
-                    except Exception:
-                        print(f"{file}: could not be read")
-                        return f
-                    if re.search(pattern, text):
-                        print(f"{file}: match found")
-                    else:
-                        print(f"{file}: match not found")
-                return f
-        raise FileNotFoundError
-    except FileNotFoundError:
-        print("file with this name not found")
 
-targetFolder = folder / folderName
+    pattern = re.escape(contentToBeSearched)
 
-searchForFileInMentionedFolder(targetFolder, fileName, pattern)
-openAllFilesAndFindPattern(pattern, targetFolder)
+    if fileName == "":
+        searchAllFiles(targetFolder, pattern)
+    else:
+        searchOneFile(targetFolder, fileName, pattern)
+
+
+main()

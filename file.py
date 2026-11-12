@@ -6,12 +6,8 @@ import re
 scriptFolder = Path(__file__).parent
 
 
-# Each readLines... function uses "yield" to hand back one line at a time,
-# so the whole file's text is never joined into one big string.
-
 def readLinesFromPdf(path):
     reader = PdfReader(path)
-    # Pages are extracted one at a time, then split into lines
     for page in reader.pages:
         pageText = page.extract_text()
         if pageText is None:
@@ -27,8 +23,6 @@ def readLinesFromDocx(path):
 
 
 def readLinesFromPlainFile(path):
-    # txt, csv, py, etc. are plain text files.
-    # Looping over the file object reads it one line at a time.
     with open(path, "r", encoding="utf-8") as file:
         for line in file:
             yield line
@@ -47,11 +41,9 @@ def readLines(path):
 
 
 def checkFileForPattern(path, pattern):
-    # Compile once so the pattern isn't re-processed for every line
     compiledPattern = re.compile(pattern)
 
     try:
-        # Check each line and stop as soon as one matches
         for line in readLines(path):
             if compiledPattern.search(line) is not None:
                 print(path.name + ": match found")
@@ -87,7 +79,6 @@ def getFileNamesInFolder(targetFolder):
             fileNames.append(item.name)
     fileNames.sort()
     return fileNames
-
 
 def main():
     folderName = input("Folder to search (leave blank for this folder): ")

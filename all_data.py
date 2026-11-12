@@ -4,7 +4,7 @@ import re
 import unicodedata
 import json
 
-# Footer lines such as "Page 3 of 34" that are not real content
+
 pageNumberPattern = re.compile(r"^\s*Page \d+ of \d+\s*$", re.IGNORECASE)
 
 # Two or more spaces/tabs in a row, squeezed down to one space
@@ -21,7 +21,6 @@ extraNewlinesPattern = re.compile(r"\n{3,}")
 
 
 def cleanText(text):
-    # NFKC turns special PDF characters like "ﬁ" into normal "fi"
     text = unicodedata.normalize("NFKC", text)
 
     # Drop page number footer lines

@@ -21,6 +21,3 @@ except FileExistsError:
 with open(BASE / "write_with_print.txt", "a") as f:
     print("hello via print", file=f)
 
-
-with open(BASE/ "notes.txt", encoding="utf-8")
-

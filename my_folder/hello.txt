@@ -1,0 +1,3 @@
+Hello this is a file inside my_folder
+this is a new line
+this is new line 2

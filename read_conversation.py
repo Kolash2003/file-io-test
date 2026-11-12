@@ -50,7 +50,9 @@ def readSpeakerTurns(path):
     # Lines without a "Name:" at the start belong to whoever spoke last,
     # because a long answer usually wraps over many lines/pages.
     # Only one turn is kept in memory at a time.
-    currentSpeaker = None
+    # Text before the first speaker (cover letter, title, date, etc.)
+    # is kept as a turn by "Document" so the first page is not lost.
+    currentSpeaker = "Document"
     currentLines = []
 
     for line in readLinesFromPdf(path):
@@ -64,21 +66,20 @@ def readSpeakerTurns(path):
 
         if match is not None:
             # A new speaker started, so hand back the previous turn first
-            if currentSpeaker is not None:
+            # (skipped if empty, e.g. a PDF that starts straight with a speaker)
+            if currentLines:
                 yield currentSpeaker, joinLines(currentLines)
             currentSpeaker = match.group("speaker").strip()
             currentLines = [match.group("text")]
-        elif currentSpeaker is not None:
+        else:
             currentLines.append(line)
-        # Text before the first speaker (title, date, etc.) is skipped
 
-    if currentSpeaker is not None:
+    if currentLines:
         yield currentSpeaker, joinLines(currentLines)
 
 
 def main():
     filePath = Path(input("File path: ").strip())
-    # Saved next to the PDF with the same name, e.g. Q4-TCS-26.pdf -> Q4-TCS-26.json
     jsonPath = filePath.with_suffix(".json")
 
     # Each turn is written as soon as it is read, so the whole

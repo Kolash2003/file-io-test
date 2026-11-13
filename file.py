@@ -1,6 +1,11 @@
 from pathlib import Path
 from pypdf import PdfReader
 from docx import Document
+from openpyxl import load_workbook
+from datetime import datetime, date
+import xml.etree.ElementTree as ElementTree
+import zipfile
+import csv
 import re
 import unicodedata
 import json
@@ -10,15 +15,23 @@ scriptFolder = Path(__file__).parent
 # Any run of spaces, tabs or newlines is squeezed down to one space
 whitespacePattern = re.compile(r"\s+")
 
-# Gap allowed between two words of the search text:
-# spaces, tabs, newlines or hyphens (so "out-of- pocket" still matches "out of pocket")
-wordGap = r"[\s\-‐-―]+"
+# Gap allowed between two words of the search text: spaces, tabs, newlines,
+# hyphens (so "out-of- pocket" still matches "out of pocket") and the " | "
+# that separates spreadsheet cells (so "net profit" matches "Net | profit")
+wordGap = r"[\s\-\u2010-\u2015|]+"
 
 # Punctuation stripped from the ends of what the user typed, e.g. "profit." -> "profit"
 edgePunctuation = ".,;:!?\"'()[]{}"
 
+# A plain number as typed by the user, e.g. "73188", "73,188" or "2.8"
+numberPattern = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
 # How many characters of context to show on each side of a match
 snippetContext = 40
+
+# Spreadsheet rows start with "[Sheet name] "; a prefix longer than this
+# is treated as ordinary text, not a sheet name
+maxSheetPrefixLength = 64
 
 # How many snippets to print per file
 maxSnippetsPerFile = 3
@@ -87,6 +100,172 @@ def readBlocksFromJson(path):
         yield pageNumber, cleanText(str(item["text"]))
 
 
+def formatCellValue(value):
+    # Turns a cell value into search text:
+    # 73188.0 -> "73188", 2.8 -> "2.8", a date -> "2026-10-14", empty -> ""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, datetime):
+        if value.hour == 0 and value.minute == 0 and value.second == 0:
+            return value.strftime("%Y-%m-%d")
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def joinCells(cellTexts):
+    # "TCS | 73188 | 2.8" with empty cells left out
+    parts = []
+    for text in cellTexts:
+        text = text.strip()
+        if text != "":
+            parts.append(text)
+    return " | ".join(parts)
+
+
+def readBlocksFromXlsx(path):
+    # One block per row: (row number, "[Sheet name] a | b | c").
+    # read_only streams one row at a time; data_only gives the computed
+    # value of a formula cell instead of the formula text.
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        for sheet in workbook.worksheets:
+            prefix = "[" + sheet.title + "] "
+            for rowNumber, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                cellTexts = []
+                for value in row:
+                    cellTexts.append(formatCellValue(value))
+                content = joinCells(cellTexts)
+                if content != "":
+                    yield rowNumber, cleanText(prefix + content)
+    finally:
+        workbook.close()
+
+
+def readBlocksFromCsv(path):
+    # One block per row, numbered by row. No sheet prefix, a CSV has no sheets.
+    with open(path, "r", encoding="utf-8", newline="") as file:
+        for rowNumber, row in enumerate(csv.reader(file), start=1):
+            content = joinCells(row)
+            if content != "":
+                yield rowNumber, cleanText(content)
+
+
+# An .ods file is a zip holding content.xml; these are the XML namespaces in it
+odsNamespaces = {
+    "table": "urn:oasis:names:tc:opendocument:xmlns:table:1.0",
+    "office": "urn:oasis:names:tc:opendocument:xmlns:office:1.0",
+    "text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
+}
+
+
+def odsTag(prefix, name):
+    return "{" + odsNamespaces[prefix] + "}" + name
+
+
+def odsCellText(cell):
+    # Same rules as formatCellValue, read from the cell's XML attributes
+    valueType = cell.get(odsTag("office", "value-type"))
+
+    if valueType in ("float", "percentage", "currency"):
+        return formatCellValue(float(cell.get(odsTag("office", "value"))))
+
+    if valueType == "date":
+        dateValue = cell.get(odsTag("office", "date-value"), "")
+        # "2026-10-14T00:00:00" -> "2026-10-14", keeps a real time if present
+        if dateValue.endswith("T00:00:00"):
+            dateValue = dateValue[:10]
+        return dateValue.replace("T", " ")
+
+    if valueType == "boolean":
+        return cell.get(odsTag("office", "boolean-value"), "").upper()
+
+    # Text (and anything else): join the cell's paragraphs
+    paragraphs = []
+    for paragraph in cell.iter(odsTag("text", "p")):
+        paragraphs.append("".join(paragraph.itertext()))
+    return " ".join(paragraphs)
+
+
+def odsRowCells(row):
+    # Cell texts of one row. Empty cells are often stored once with a huge
+    # "repeated" count, so a repeated cell is only expanded when it has text.
+    cellTexts = []
+    for cell in row:
+        if cell.tag not in (odsTag("table", "table-cell"), odsTag("table", "covered-table-cell")):
+            continue
+        text = odsCellText(cell)
+        if text.strip() == "":
+            continue
+        repeatCount = int(cell.get(odsTag("table", "number-columns-repeated"), "1"))
+        cellTexts.extend([text] * repeatCount)
+    return cellTexts
+
+
+def readBlocksFromOds(path):
+    # Streams content.xml row by row, so a large sheet is never fully in memory
+    with zipfile.ZipFile(path) as archive:
+        with archive.open("content.xml") as contentFile:
+            sheetName = ""
+            rowNumber = 0
+            for event, element in ElementTree.iterparse(contentFile, events=("start", "end")):
+                if event == "start" and element.tag == odsTag("table", "table"):
+                    sheetName = element.get(odsTag("table", "name"), "")
+                    rowNumber = 0
+                    continue
+
+                if event == "end" and element.tag == odsTag("table", "table-row"):
+                    repeatCount = int(element.get(odsTag("table", "number-rows-repeated"), "1"))
+                    content = joinCells(odsRowCells(element))
+                    if content != "":
+                        for _ in range(repeatCount):
+                            rowNumber += 1
+                            yield rowNumber, cleanText("[" + sheetName + "] " + content)
+                    else:
+                        rowNumber += repeatCount
+                    element.clear()
+
+                elif event == "end" and element.tag == odsTag("table", "table"):
+                    element.clear()
+
+
+def jsonPageMeaning(path):
+    # Looks at the first item to say what a "page" is in this JSON file
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except Exception:
+        return "starting line of each paragraph"
+    if not isinstance(data, list):
+        return "starting line of each paragraph"
+    if data and isinstance(data[0], dict) and "page" in data[0]:
+        return "PDF page number stored in the JSON"
+    if data and isinstance(data[0], dict) and "speaker" in data[0]:
+        return "speaker turn number (the file has no page numbers)"
+    return "item number in the JSON list"
+
+
+def pageMeaning(path):
+    # Explains what the "page" number means for this kind of file
+    extension = path.suffix.lower()
+    if extension == ".pdf":
+        return "PDF page number"
+    if extension == ".docx":
+        return "paragraph number"
+    if extension == ".json":
+        return jsonPageMeaning(path)
+    if extension in (".xlsx", ".xlsm", ".ods"):
+        return "row number within the sheet named in [brackets]"
+    if extension == ".csv":
+        return "row number"
+    return "starting line of each paragraph (blank-line separated)"
+
+
 def readBlocks(path):
     # Yields (pageNumber, text) blocks. For files without real pages
     # (docx, plain text, conversation JSON) the number is the paragraph,
@@ -102,6 +281,15 @@ def readBlocks(path):
     if extension == ".json":
         return readBlocksFromJson(path)
 
+    if extension in (".xlsx", ".xlsm"):
+        return readBlocksFromXlsx(path)
+
+    if extension == ".csv":
+        return readBlocksFromCsv(path)
+
+    if extension == ".ods":
+        return readBlocksFromOds(path)
+
     return readBlocksFromPlainFile(path)
 
 
@@ -114,21 +302,48 @@ def splitIntoWords(text):
     return words
 
 
+def escapeWord(word):
+    # A number matches with or without thousands separators:
+    # "73188" or "73,188" both find "73188", "73,188" and "₹73,188"
+    if numberPattern.fullmatch(word):
+        wholePart, dot, fraction = word.partition(".")
+        digits = wholePart.replace(",", "")
+        body = ",?".join(digits)
+        if dot:
+            body = body + r"\." + fraction
+        return body
+    return re.escape(word)
+
+
 def buildPattern(words):
     # Words joined by a flexible gap, wrapped so only whole words match:
     # "tcs" matches "TCS" and "TCS." but not "etcsomething"
     escapedWords = []
     for word in words:
-        escapedWords.append(re.escape(word))
+        escapedWords.append(escapeWord(word))
     body = wordGap.join(escapedWords)
     return re.compile(r"(?<!\w)" + body + r"(?!\w)", re.IGNORECASE)
+
+
+def sheetPrefix(text):
+    # "[Q2 Data] TCS | 73188" -> "[Q2 Data] ", or "" when there is no prefix
+    if not text.startswith("["):
+        return ""
+    prefixEnd = text.find("] ")
+    if prefixEnd == -1 or prefixEnd > maxSheetPrefixLength:
+        return ""
+    return text[:prefixEnd + 2]
 
 
 def makeSnippet(text, start, end):
     snippetStart = max(0, start - snippetContext)
     snippetEnd = min(len(text), end + snippetContext)
     snippet = text[snippetStart:snippetEnd]
-    if snippetStart > 0:
+    prefix = sheetPrefix(text)
+    if snippetStart > len(prefix):
+        # Keep the sheet name visible even when the match is far into the row
+        snippet = prefix + "..." + snippet
+    elif snippetStart > 0:
         snippet = "..." + snippet
     if snippetEnd < len(text):
         snippet = snippet + "..."
@@ -187,7 +402,12 @@ def searchFile(path, searchMode, words):
     else:
         found = foundCount > 0
 
-    return {"file": path.name, "found": found, "terms": termResults}
+    return {
+        "file": path.name,
+        "pageMeans": pageMeaning(path),
+        "found": found,
+        "terms": termResults,
+    }
 
 
 def searchOneFile(targetFolder, fileName, searchMode, words):
@@ -274,6 +494,7 @@ def printReport(summary):
 
         print()
         print(" " + fileResult["file"].ljust(reportWidth - 10, ".") + " FOUND")
+        print("   page = " + fileResult["pageMeans"])
         for termResult in fileResult["terms"]:
             printTermResult(termResult, "   ")
 

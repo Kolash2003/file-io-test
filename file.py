@@ -19,6 +19,13 @@ whitespacePattern = re.compile(r"\s+")
 # hyphens (so "out-of- pocket" still matches "out of pocket") and the " | "
 # that separates spreadsheet cells (so "net profit" matches "Net | profit")
 wordGap = r"[\s\-\u2010-\u2015|]+"
+wordGapPattern = re.compile(wordGap)
+
+# Text inside double quotes (straight or curly) is matched exactly as typed:
+# "revenue" finds revenue but not revenues
+quotedPattern = re.compile(r'["\u201c\u201d]([^"\u201c\u201d]*)["\u201c\u201d]')
+
+vowels = "aeiou"
 
 # Punctuation stripped from the ends of what the user typed, e.g. "profit." -> "profit"
 edgePunctuation = ".,;:!?\"'()[]{}"
@@ -302,6 +309,88 @@ def splitIntoWords(text):
     return words
 
 
+def parseSearchText(text):
+    # Splits what the user typed into words, each {"text": "revenue", "exact": False}.
+    # Words inside double quotes are exact; all other words also match their
+    # plural/singular spellings. An unmatched quote is treated as punctuation.
+    words = []
+    position = 0
+    for match in quotedPattern.finditer(text):
+        for word in splitIntoWords(text[position:match.start()]):
+            words.append({"text": word, "exact": False})
+        for word in splitIntoWords(match.group(1)):
+            words.append({"text": word, "exact": True})
+        position = match.end()
+    for word in splitIntoWords(text[position:]):
+        words.append({"text": word, "exact": False})
+    return words
+
+
+def termLabel(words):
+    # How a term is shown in the report: net "profit"  (quotes mark an exact word)
+    parts = []
+    for word in words:
+        if word["exact"]:
+            parts.append('"' + word["text"] + '"')
+        else:
+            parts.append(word["text"])
+    return " ".join(parts)
+
+
+def singularForms(word):
+    # Possible singulars of a typed word: revenues -> revenue, companies -> company,
+    # losses -> loss, taxes -> tax, halves -> half. A wrong guess is harmless:
+    # a form only counts when it actually appears in a file.
+    forms = []
+    if word.endswith("ies") and len(word) > 4:
+        forms.append(word[:-3] + "y")
+    if word.endswith("ves") and len(word) > 4:
+        forms.append(word[:-3] + "f")
+        forms.append(word[:-3] + "fe")
+    if word.endswith(("sses", "shes", "ches", "xes", "zes", "oes")):
+        forms.append(word[:-2])
+    if word.endswith("s") and not word.endswith("ss"):
+        forms.append(word[:-1])
+    # Very short stems ("gas" -> "ga") would match unrelated words, so skip them
+    kept = []
+    for form in forms:
+        if len(form) >= 3:
+            kept.append(form)
+    return kept
+
+
+def pluralForms(word):
+    # Plurals of a singular: company -> companies, loss -> losses,
+    # half -> halves, tax -> taxes, revenue -> revenues
+    forms = []
+    if word.endswith("y") and len(word) > 1 and word[-2] not in vowels:
+        forms.append(word[:-1] + "ies")
+    if word.endswith("fe"):
+        forms.append(word[:-2] + "ves")
+    elif word.endswith("f"):
+        forms.append(word[:-1] + "ves")
+    if word.endswith(("s", "x", "z", "ch", "sh", "o")):
+        forms.append(word + "es")
+    forms.append(word + "s")
+    return forms
+
+
+def wordForms(word):
+    # Every spelling a typed word may have in a file, the typed one first.
+    # Only plain words get variants; numbers and mixed words like "q2" or
+    # "covid-19" are left exactly as typed.
+    if not word.isalpha():
+        return [word]
+    lower = word.lower()
+    bases = [lower] + singularForms(lower)
+    forms = []
+    for base in bases:
+        for form in [base] + pluralForms(base):
+            if form not in forms:
+                forms.append(form)
+    return forms
+
+
 def escapeWord(word):
     # A number matches with or without thousands separators:
     # "73188" or "73,188" both find "73188", "73,188" and "₹73,188"
@@ -315,12 +404,27 @@ def escapeWord(word):
     return re.escape(word)
 
 
+def wordPattern(word):
+    # Regex for one typed word. An exact word is used as typed; any other word
+    # becomes an alternation of its spellings: (?:revenues|revenue)
+    if word["exact"]:
+        return escapeWord(word["text"])
+    forms = wordForms(word["text"])
+    if len(forms) == 1:
+        return escapeWord(forms[0])
+    forms.sort(key=len, reverse=True)
+    escapedForms = []
+    for form in forms:
+        escapedForms.append(re.escape(form))
+    return "(?:" + "|".join(escapedForms) + ")"
+
+
 def buildPattern(words):
     # Words joined by a flexible gap, wrapped so only whole words match:
     # "tcs" matches "TCS" and "TCS." but not "etcsomething"
     escapedWords = []
     for word in words:
-        escapedWords.append(escapeWord(word))
+        escapedWords.append(wordPattern(word))
     body = wordGap.join(escapedWords)
     return re.compile(r"(?<!\w)" + body + r"(?!\w)", re.IGNORECASE)
 
@@ -350,18 +454,26 @@ def makeSnippet(text, start, end):
     return snippet
 
 
+def matchedForm(matchText):
+    # "Net | Profits" -> "net profits", so one wording is counted once in the breakdown
+    return wordGapPattern.sub(" ", matchText).lower()
+
+
 def findMatches(path, compiledPatterns):
     # Returns one result per pattern:
-    # {"count": 3, "pages": [1, 2], "snippets": [{"page": 1, "text": "..."}, ...]}
+    # {"count": 3, "pages": [1, 2], "forms": {"revenue": 2, "revenues": 1},
+    #  "snippets": [{"page": 1, "text": "..."}, ...]}
     results = []
     for _ in compiledPatterns:
-        results.append({"count": 0, "pages": [], "snippets": []})
+        results.append({"count": 0, "pages": [], "forms": {}, "snippets": []})
 
     for pageNumber, text in readBlocks(path):
         for index, compiledPattern in enumerate(compiledPatterns):
             result = results[index]
             for match in compiledPattern.finditer(text):
                 result["count"] += 1
+                form = matchedForm(match.group())
+                result["forms"][form] = result["forms"].get(form, 0) + 1
                 if pageNumber not in result["pages"]:
                     result["pages"].append(pageNumber)
                 if len(result["snippets"]) < maxSnippetsPerFile:
@@ -375,12 +487,13 @@ def searchFile(path, searchMode, words):
     # {"file": "x.pdf", "found": True, "terms": [{"term": "tcs", "count": 3, ...}]}
     # or {"file": "x.pdf", "error": "could not be read"}
     if searchMode == "phrase":
-        terms = [" ".join(words)]
+        terms = [termLabel(words)]
         patterns = [buildPattern(words)]
     else:
-        terms = words
+        terms = []
         patterns = []
         for word in words:
+            terms.append(termLabel([word]))
             patterns.append(buildPattern([word]))
 
     try:
@@ -461,6 +574,20 @@ def formatPageList(pages):
     return text
 
 
+def printFormBreakdown(termResult, indent):
+    # "forms: revenues x3, revenue x2" when a plural/singular or a differently
+    # written number was counted; nothing is printed when only the typed
+    # spelling was found
+    forms = termResult["forms"]
+    typed = termResult["term"].replace('"', "").lower()
+    if len(forms) == 1 and typed in forms:
+        return
+    parts = []
+    for form, count in sorted(forms.items(), key=lambda item: -item[1]):
+        parts.append(form + " x" + str(count))
+    print(indent + "    forms: " + ", ".join(parts))
+
+
 def printTermResult(termResult, indent):
     term = "'" + termResult["term"] + "'"
     if termResult["count"] == 0:
@@ -470,6 +597,7 @@ def printTermResult(termResult, indent):
     noun = "match" if termResult["count"] == 1 else "matches"
     countText = (str(termResult["count"]) + " " + noun).ljust(13)
     print(indent + term.ljust(18) + countText + formatPageList(termResult["pages"]))
+    printFormBreakdown(termResult, indent)
     for snippet in termResult["snippets"]:
         print(indent + "    page " + str(snippet["page"]) + ": " + snippet["text"])
 
@@ -477,7 +605,8 @@ def printTermResult(termResult, indent):
 def printReport(summary):
     print()
     print("=" * reportWidth)
-    print(" Search : \"" + summary["search"] + "\"   (" + modeDescriptions[summary["mode"]] + ")")
+    print(" Search : " + summary["search"] + "   (" + modeDescriptions[summary["mode"]] + ")")
+    print(" Words  : plurals/singulars also count; a \"quoted\" word matches only as typed")
     print(" Folder : " + summary["folder"])
     print(" Files  : " + str(len(summary["results"])) + " searched")
     print("=" * reportWidth)
@@ -575,7 +704,7 @@ def main():
     fileName = fileName.strip()
 
     contentToBeSearched = input("Text to search for: ")
-    words = splitIntoWords(cleanText(contentToBeSearched))
+    words = parseSearchText(cleanText(contentToBeSearched))
 
     if not words:
         print("search text cannot be empty")
@@ -593,7 +722,7 @@ def main():
         return
 
     summary = {
-        "search": " ".join(words),
+        "search": termLabel(words),
         "mode": searchMode,
         "folder": str(targetFolder),
         "results": fileResults,

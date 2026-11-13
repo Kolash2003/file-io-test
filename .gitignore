@@ -29,3 +29,7 @@ Thumbs.db
 
 # Data
 searchFolder/
+presentation_assets/
+create_presentation.py
+file_io_search_architecture.pdf
+file_io_search_architecture.pptx
